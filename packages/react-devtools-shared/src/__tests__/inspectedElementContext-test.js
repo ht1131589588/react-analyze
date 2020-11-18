@@ -796,6 +796,57 @@ describe('InspectedElementContext', () => {
     done();
   });
 
+  it('should not consume iterables while inspecting', async done => {
+    const Example = () => null;
+
+    function* generator() {
+      throw Error('Should not be consumed!');
+    }
+
+    const container = document.createElement('div');
+
+    const iterable = generator();
+    await utils.actAsync(() =>
+      ReactDOM.render(<Example prop={iterable} />, container),
+    );
+
+    const id = ((store.getElementIDAtIndex(0): any): number);
+
+    let inspectedElement = null;
+
+    function Suspender({target}) {
+      const {getInspectedElement} = React.useContext(InspectedElementContext);
+      inspectedElement = getInspectedElement(id);
+      return null;
+    }
+
+    await utils.actAsync(
+      () =>
+        TestRenderer.create(
+          <Contexts
+            defaultSelectedElementID={id}
+            defaultSelectedElementIndex={0}>
+            <React.Suspense fallback={null}>
+              <Suspender target={id} />
+            </React.Suspense>
+          </Contexts>,
+        ),
+      false,
+    );
+
+    expect(inspectedElement).not.toBeNull();
+    expect(inspectedElement).toMatchSnapshot(`1: Inspected element ${id}`);
+
+    const {prop} = (inspectedElement: any).props;
+    expect(prop[meta.inspectable]).toBe(false);
+    expect(prop[meta.name]).toBe('Generator');
+    expect(prop[meta.type]).toBe('opaque_iterator');
+    expect(prop[meta.preview_long]).toBe('Generator');
+    expect(prop[meta.preview_short]).toBe('Generator');
+
+    done();
+  });
+
   it('should support objects with no prototype', async done => {
     const Example = () => null;
 
@@ -989,7 +1040,7 @@ describe('InspectedElementContext', () => {
         enumerable: false,
         configurable: true,
       },
-      [123]: {
+      123: {
         value: 3,
         writable: true,
         enumerable: true,
@@ -1705,7 +1756,7 @@ describe('InspectedElementContext', () => {
     done();
   });
 
-  it('display complex values of useDebugValue', async done => {
+  it('should display complex values of useDebugValue', async done => {
     let getInspectedElementPath: GetInspectedElementPath = ((null: any): GetInspectedElementPath);
     let inspectedElement = null;
     function Suspender({target}) {

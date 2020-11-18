@@ -54,19 +54,11 @@ import {
   IncompleteClassComponent,
   FundamentalComponent,
   ScopeComponent,
-  Block,
   OffscreenComponent,
   LegacyHiddenComponent,
 } from './ReactWorkTags';
 import {NoMode, BlockingMode, ProfileMode} from './ReactTypeOfMode';
-import {
-  Ref,
-  Update,
-  NoFlags,
-  DidCapture,
-  Snapshot,
-  MutationMask,
-} from './ReactFiberFlags';
+import {Ref, Update, NoFlags, DidCapture, Snapshot} from './ReactFiberFlags';
 import invariant from 'shared/invariant';
 
 import {
@@ -127,7 +119,6 @@ import {
   enableSuspenseServerRenderer,
   enableFundamentalAPI,
   enableScopeAPI,
-  enableBlocksAPI,
   enableProfilerTimer,
 } from 'shared/ReactFeatureFlags';
 import {
@@ -152,25 +143,6 @@ function markUpdate(workInProgress: Fiber) {
 
 function markRef(workInProgress: Fiber) {
   workInProgress.flags |= Ref;
-}
-
-function hadNoMutationsEffects(current: null | Fiber, completedWork: Fiber) {
-  const didBailout = current !== null && current.child === completedWork.child;
-  if (didBailout) {
-    return true;
-  }
-
-  let child = completedWork.child;
-  while (child !== null) {
-    if ((child.flags & MutationMask) !== NoFlags) {
-      return false;
-    }
-    if ((child.subtreeFlags & MutationMask) !== NoFlags) {
-      return false;
-    }
-    child = child.sibling;
-  }
-  return true;
 }
 
 let appendAllChildren;
@@ -217,7 +189,7 @@ if (supportsMutation) {
     }
   };
 
-  updateHostContainer = function(current: null | Fiber, workInProgress: Fiber) {
+  updateHostContainer = function(workInProgress: Fiber) {
     // Noop
   };
   updateHostComponent = function(
@@ -461,13 +433,13 @@ if (supportsMutation) {
       node = node.sibling;
     }
   };
-  updateHostContainer = function(current: null | Fiber, workInProgress: Fiber) {
+  updateHostContainer = function(workInProgress: Fiber) {
     const portalOrRoot: {
       containerInfo: Container,
       pendingChildren: ChildSet,
       ...
     } = workInProgress.stateNode;
-    const childrenUnchanged = hadNoMutationsEffects(current, workInProgress);
+    const childrenUnchanged = workInProgress.firstEffect === null;
     if (childrenUnchanged) {
       // No changes, just reuse the existing instance.
     } else {
@@ -492,7 +464,7 @@ if (supportsMutation) {
     const oldProps = current.memoizedProps;
     // If there are no effects associated with this node, then none of our children had any updates.
     // This guarantees that we can reuse all of them.
-    const childrenUnchanged = hadNoMutationsEffects(current, workInProgress);
+    const childrenUnchanged = workInProgress.firstEffect === null;
     if (childrenUnchanged && oldProps === newProps) {
       // No changes, just reuse the existing instance.
       // Note that this might release a previous clone.
@@ -575,7 +547,7 @@ if (supportsMutation) {
   };
 } else {
   // No host operations
-  updateHostContainer = function(current: null | Fiber, workInProgress: Fiber) {
+  updateHostContainer = function(workInProgress: Fiber) {
     // Noop
   };
   updateHostComponent = function(
@@ -719,7 +691,7 @@ function completeWork(
           workInProgress.flags |= Snapshot;
         }
       }
-      updateHostContainer(current, workInProgress);
+      updateHostContainer(workInProgress);
       return null;
     }
     case HostComponent: {
@@ -968,7 +940,7 @@ function completeWork(
     }
     case HostPortal:
       popHostContainer(workInProgress);
-      updateHostContainer(current, workInProgress);
+      updateHostContainer(workInProgress);
       if (current === null) {
         preparePortalMount(workInProgress.stateNode.containerInfo);
       }
@@ -1047,8 +1019,12 @@ function completeWork(
 
                 // Rerender the whole list, but this time, we'll force fallbacks
                 // to stay in place.
+                // Reset the effect list before doing the second pass since that's now invalid.
+                if (renderState.lastEffect === null) {
+                  workInProgress.firstEffect = null;
+                }
+                workInProgress.lastEffect = renderState.lastEffect;
                 // Reset the child fibers to their original state.
-                workInProgress.subtreeFlags = NoFlags;
                 resetChildFibers(workInProgress, renderLanes);
 
                 // Set up the Suspense Context to force suspense and immediately
@@ -1116,6 +1092,15 @@ function completeWork(
               !renderedTail.alternate &&
               !getIsHydrating() // We don't cut it if we're hydrating.
             ) {
+              // We need to delete the row we just rendered.
+              // Reset the effect list to what it was before we rendered this
+              // child. The nested children have already appended themselves.
+              const lastEffect = (workInProgress.lastEffect =
+                renderState.lastEffect);
+              // Remove any effects that were appended after this point.
+              if (lastEffect !== null) {
+                lastEffect.nextEffect = null;
+              }
               // We're done.
               return null;
             }
@@ -1136,10 +1121,13 @@ function completeWork(
             cutOffTailIfNeeded(renderState, false);
 
             // Since nothing actually suspended, there will nothing to ping this
-            // to get it started back up to attempt the next item. If we can show
-            // them, then they really have the same priority as this render.
-            // So we'll pick it back up the very next render pass once we've had
-            // an opportunity to yield for paint.
+            // to get it started back up to attempt the next item. While in terms
+            // of priority this work has the same priority as this current render,
+            // it's not part of the same transition once the transition has
+            // committed. If it's sync, we still want to yield so that it can be
+            // painted. Conceptually, this is really the same as pinging.
+            // We can use any RetryLane even if it's the one currently rendering
+            // since we're leaving it behind on this node.
             workInProgress.lanes = SomeRetryLane;
             if (enableSchedulerTracing) {
               markSpawnedWork(SomeRetryLane);
@@ -1171,6 +1159,7 @@ function completeWork(
         const next = renderState.tail;
         renderState.rendering = next;
         renderState.tail = next.sibling;
+        renderState.lastEffect = workInProgress.lastEffect;
         renderState.renderingStartTime = now();
         next.sibling = null;
 
@@ -1265,11 +1254,6 @@ function completeWork(
       }
       break;
     }
-    case Block:
-      if (enableBlocksAPI) {
-        return null;
-      }
-      break;
     case OffscreenComponent:
     case LegacyHiddenComponent: {
       popRenderLanes(workInProgress);

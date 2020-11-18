@@ -22,6 +22,8 @@ import {
   replayFailedUnitOfWorkWithInvokeGuardedCallback,
   enableProfilerTimer,
   enableProfilerCommitHooks,
+  enableProfilerNestedUpdatePhase,
+  enableProfilerNestedUpdateScheduledHook,
   enableSchedulerTracing,
   warnAboutUnmockedScheduler,
   deferRenderPhaseUpdateToNextBatch,
@@ -29,8 +31,6 @@ import {
   enableDebugTracing,
   enableSchedulingProfiler,
   enableScopeAPI,
-  skipUnmountedBoundaries,
-  disableSchedulerTimeoutInWorkLoop,
 } from 'shared/ReactFeatureFlags';
 import ReactSharedInternals from 'shared/ReactSharedInternals';
 import invariant from 'shared/invariant';
@@ -110,10 +110,10 @@ import {
   ForwardRef,
   MemoComponent,
   SimpleMemoComponent,
-  Block,
   OffscreenComponent,
   LegacyHiddenComponent,
   ScopeComponent,
+  Profiler,
 } from './ReactWorkTags';
 import {LegacyRoot} from './ReactRootTags';
 import {
@@ -210,11 +210,14 @@ import {
 } from './ReactFiberStack.old';
 
 import {
+  markNestedUpdateScheduled,
   recordCommitTime,
   recordPassiveEffectDuration,
+  resetNestedUpdateFlag,
   startPassiveEffectTimer,
   startProfilerTimer,
   stopProfilerTimerIfRunningAndRecordDelta,
+  syncNestedUpdateFlag,
 } from './ReactProfilerTimer.old';
 
 // DEV stuff
@@ -328,6 +331,10 @@ let nextEffect: Fiber | null = null;
 let hasUncaughtError = false;
 let firstUncaughtError = null;
 let legacyErrorBoundariesThatAlreadyFailed: Set<mixed> | null = null;
+
+// Only used when enableProfilerNestedUpdateScheduledHook is true;
+// to track which root is currently committing layout effects.
+let rootCommittingMutationOrLayoutEffects: FiberRoot | null = null;
 
 let rootDoesHavePassiveEffects: boolean = false;
 let rootWithPendingPassiveEffects: FiberRoot | null = null;
@@ -532,6 +539,30 @@ export function scheduleUpdateOnFiber(
 
   // Mark that the root has a pending update.
   markRootUpdated(root, lane, eventTime);
+
+  if (enableProfilerTimer && enableProfilerNestedUpdateScheduledHook) {
+    if (
+      executionContext === CommitContext &&
+      root === rootCommittingMutationOrLayoutEffects
+    ) {
+      if (fiber.mode & ProfileMode) {
+        let current = fiber;
+        while (current !== null) {
+          if (current.tag === Profiler) {
+            const {onNestedUpdateScheduled} = current.memoizedProps;
+            if (typeof onNestedUpdateScheduled === 'function') {
+              if (enableSchedulerTracing) {
+                onNestedUpdateScheduled(root.memoizedInteractions);
+              } else {
+                onNestedUpdateScheduled();
+              }
+            }
+          }
+          current = current.return;
+        }
+      }
+    }
+  }
 
   if (root === workInProgressRoot) {
     // Received an update to a tree that's in the middle of rendering. Mark
@@ -739,7 +770,11 @@ function ensureRootIsScheduled(root: FiberRoot, currentTime: number) {
 
 // This is the entry point for every concurrent task, i.e. anything that
 // goes through Scheduler.
-function performConcurrentWorkOnRoot(root, didTimeout) {
+function performConcurrentWorkOnRoot(root) {
+  if (enableProfilerTimer && enableProfilerNestedUpdatePhase) {
+    resetNestedUpdateFlag();
+  }
+
   // Since we know we're in a React event, we can clear the current
   // event time. The next update will compute a new event time.
   currentEventTime = NoTimestamp;
@@ -776,18 +811,6 @@ function performConcurrentWorkOnRoot(root, didTimeout) {
   );
   if (lanes === NoLanes) {
     // Defensive coding. This is never expected to happen.
-    return null;
-  }
-
-  // TODO: We only check `didTimeout` defensively, to account for a Scheduler
-  // bug we're still investigating. Once the bug in Scheduler is fixed,
-  // we can remove this, since we track expiration ourselves.
-  if (!disableSchedulerTimeoutInWorkLoop && didTimeout) {
-    // Something expired. Flush synchronously until there's no expired
-    // work left.
-    markRootExpired(root, lanes);
-    // This will schedule a synchronous callback.
-    ensureRootIsScheduled(root, now());
     return null;
   }
 
@@ -977,6 +1000,10 @@ function markRootSuspended(root, suspendedLanes) {
 // This is the entry point for synchronous tasks that don't go
 // through Scheduler
 function performSyncWorkOnRoot(root) {
+  if (enableProfilerTimer && enableProfilerNestedUpdatePhase) {
+    syncNestedUpdateFlag();
+  }
+
   invariant(
     (executionContext & (RenderContext | CommitContext)) === NoContext,
     'Should not already be working.',
@@ -2032,7 +2059,7 @@ function commitRootImpl(root, renderPriorityLevel) {
         if (hasCaughtError()) {
           invariant(nextEffect !== null, 'Should be working on an effect.');
           const error = clearCaughtError();
-          captureCommitPhaseError(nextEffect, nextEffect.return, error);
+          captureCommitPhaseError(nextEffect, error);
           nextEffect = nextEffect.nextEffect;
         }
       } else {
@@ -2040,7 +2067,7 @@ function commitRootImpl(root, renderPriorityLevel) {
           commitBeforeMutationEffects();
         } catch (error) {
           invariant(nextEffect !== null, 'Should be working on an effect.');
-          captureCommitPhaseError(nextEffect, nextEffect.return, error);
+          captureCommitPhaseError(nextEffect, error);
           nextEffect = nextEffect.nextEffect;
         }
       }
@@ -2053,6 +2080,12 @@ function commitRootImpl(root, renderPriorityLevel) {
       // Mark the current commit time to be shared by all Profilers in this
       // batch. This enables them to be grouped later.
       recordCommitTime();
+    }
+
+    if (enableProfilerTimer && enableProfilerNestedUpdateScheduledHook) {
+      // Track the root here, rather than in commitLayoutEffects(), because of ref setters.
+      // Updates scheduled during ref detachment should also be flagged.
+      rootCommittingMutationOrLayoutEffects = root;
     }
 
     // The next phase is the mutation phase, where we mutate the host tree.
@@ -2069,7 +2102,7 @@ function commitRootImpl(root, renderPriorityLevel) {
         if (hasCaughtError()) {
           invariant(nextEffect !== null, 'Should be working on an effect.');
           const error = clearCaughtError();
-          captureCommitPhaseError(nextEffect, nextEffect.return, error);
+          captureCommitPhaseError(nextEffect, error);
           nextEffect = nextEffect.nextEffect;
         }
       } else {
@@ -2077,7 +2110,7 @@ function commitRootImpl(root, renderPriorityLevel) {
           commitMutationEffects(root, renderPriorityLevel);
         } catch (error) {
           invariant(nextEffect !== null, 'Should be working on an effect.');
-          captureCommitPhaseError(nextEffect, nextEffect.return, error);
+          captureCommitPhaseError(nextEffect, error);
           nextEffect = nextEffect.nextEffect;
         }
       }
@@ -2104,7 +2137,7 @@ function commitRootImpl(root, renderPriorityLevel) {
         if (hasCaughtError()) {
           invariant(nextEffect !== null, 'Should be working on an effect.');
           const error = clearCaughtError();
-          captureCommitPhaseError(nextEffect, nextEffect.return, error);
+          captureCommitPhaseError(nextEffect, error);
           nextEffect = nextEffect.nextEffect;
         }
       } else {
@@ -2112,13 +2145,17 @@ function commitRootImpl(root, renderPriorityLevel) {
           commitLayoutEffects(root, lanes);
         } catch (error) {
           invariant(nextEffect !== null, 'Should be working on an effect.');
-          captureCommitPhaseError(nextEffect, nextEffect.return, error);
+          captureCommitPhaseError(nextEffect, error);
           nextEffect = nextEffect.nextEffect;
         }
       }
     } while (nextEffect !== null);
 
     nextEffect = null;
+
+    if (enableProfilerTimer && enableProfilerNestedUpdateScheduledHook) {
+      rootCommittingMutationOrLayoutEffects = null;
+    }
 
     // Tell Scheduler to yield at the end of the frame, so the browser has an
     // opportunity to paint.
@@ -2204,6 +2241,10 @@ function commitRootImpl(root, renderPriorityLevel) {
   }
 
   if (remainingLanes === SyncLane) {
+    if (enableProfilerTimer && enableProfilerNestedUpdatePhase) {
+      markNestedUpdateScheduled();
+    }
+
     // Count the number of times the root synchronously re-renders without
     // finishing. If there are too many, it indicates an infinite update loop.
     if (root === rootWithNestedUpdates) {
@@ -2275,7 +2316,7 @@ function commitBeforeMutationEffects() {
       if ((nextEffect.flags & Deletion) !== NoFlags) {
         if (doesFiberContain(nextEffect, focusedInstanceHandle)) {
           shouldFireAfterActiveInstanceBlur = true;
-          beforeActiveInstanceBlur();
+          beforeActiveInstanceBlur(nextEffect);
         }
       } else {
         // TODO: Move this out of the hot path using a dedicated effect tag.
@@ -2285,7 +2326,7 @@ function commitBeforeMutationEffects() {
           doesFiberContain(nextEffect, focusedInstanceHandle)
         ) {
           shouldFireAfterActiveInstanceBlur = true;
-          beforeActiveInstanceBlur();
+          beforeActiveInstanceBlur(nextEffect);
         }
       }
     }
@@ -2313,10 +2354,7 @@ function commitBeforeMutationEffects() {
   }
 }
 
-function commitMutationEffects(
-  root: FiberRoot,
-  renderPriorityLevel: ReactPriorityLevel,
-) {
+function commitMutationEffects(root: FiberRoot, renderPriorityLevel) {
   // TODO: Should probably move the bulk of this function to commitWork.
   while (nextEffect !== null) {
     setCurrentDebugFiberInDEV(nextEffect);
@@ -2386,12 +2424,7 @@ function commitMutationEffects(
         break;
       }
       case Deletion: {
-        commitDeletion(
-          root,
-          nextEffect,
-          nextEffect.return,
-          renderPriorityLevel,
-        );
+        commitDeletion(root, nextEffect, renderPriorityLevel);
         break;
       }
     }
@@ -2602,7 +2635,7 @@ function flushPassiveEffectsImpl() {
         if (hasCaughtError()) {
           invariant(fiber !== null, 'Should be working on an effect.');
           const error = clearCaughtError();
-          captureCommitPhaseError(fiber, fiber.return, error);
+          captureCommitPhaseError(fiber, error);
         }
         resetCurrentDebugFiberInDEV();
       } else {
@@ -2623,7 +2656,7 @@ function flushPassiveEffectsImpl() {
           }
         } catch (error) {
           invariant(fiber !== null, 'Should be working on an effect.');
-          captureCommitPhaseError(fiber, fiber.return, error);
+          captureCommitPhaseError(fiber, error);
         }
       }
     }
@@ -2650,7 +2683,7 @@ function flushPassiveEffectsImpl() {
       if (hasCaughtError()) {
         invariant(fiber !== null, 'Should be working on an effect.');
         const error = clearCaughtError();
-        captureCommitPhaseError(fiber, fiber.return, error);
+        captureCommitPhaseError(fiber, error);
       }
       resetCurrentDebugFiberInDEV();
     } else {
@@ -2672,7 +2705,7 @@ function flushPassiveEffectsImpl() {
         }
       } catch (error) {
         invariant(fiber !== null, 'Should be working on an effect.');
-        captureCommitPhaseError(fiber, fiber.return, error);
+        captureCommitPhaseError(fiber, error);
       }
     }
   }
@@ -2771,11 +2804,7 @@ function captureCommitPhaseErrorOnRoot(
   }
 }
 
-export function captureCommitPhaseError(
-  sourceFiber: Fiber,
-  nearestMountedAncestor: Fiber | null,
-  error: mixed,
-) {
+export function captureCommitPhaseError(sourceFiber: Fiber, error: mixed) {
   if (sourceFiber.tag === HostRoot) {
     // Error was thrown at the root. There is no parent, so the root
     // itself should capture it.
@@ -2783,13 +2812,7 @@ export function captureCommitPhaseError(
     return;
   }
 
-  let fiber = null;
-  if (skipUnmountedBoundaries) {
-    fiber = nearestMountedAncestor;
-  } else {
-    fiber = sourceFiber.return;
-  }
-
+  let fiber = sourceFiber.return;
   while (fiber !== null) {
     if (fiber.tag === HostRoot) {
       captureCommitPhaseErrorOnRoot(fiber, sourceFiber, error);
@@ -2815,24 +2838,6 @@ export function captureCommitPhaseError(
           markRootUpdated(root, SyncLane, eventTime);
           ensureRootIsScheduled(root, eventTime);
           schedulePendingInteractions(root, SyncLane);
-        } else {
-          // This component has already been unmounted.
-          // We can't schedule any follow up work for the root because the fiber is already unmounted,
-          // but we can still call the log-only boundary so the error isn't swallowed.
-          //
-          // TODO This is only a temporary bandaid for the old reconciler fork.
-          // We can delete this special case once the new fork is merged.
-          if (
-            typeof instance.componentDidCatch === 'function' &&
-            !isAlreadyFailedLegacyErrorBoundary(instance)
-          ) {
-            try {
-              instance.componentDidCatch(error, errorInfo);
-            } catch (errorToIgnore) {
-              // TODO Ignore this error? Rethrow it?
-              // This is kind of an edge case.
-            }
-          }
         }
         return;
       }
@@ -3034,8 +3039,7 @@ function warnAboutUpdateOnNotYetMountedFiberInDEV(fiber) {
       tag !== FunctionComponent &&
       tag !== ForwardRef &&
       tag !== MemoComponent &&
-      tag !== SimpleMemoComponent &&
-      tag !== Block
+      tag !== SimpleMemoComponent
     ) {
       // Only warn for user-defined components, not internal ones like Suspense.
       return;
@@ -3082,8 +3086,7 @@ function warnAboutUpdateOnUnmountedFiberInDEV(fiber) {
       tag !== FunctionComponent &&
       tag !== ForwardRef &&
       tag !== MemoComponent &&
-      tag !== SimpleMemoComponent &&
-      tag !== Block
+      tag !== SimpleMemoComponent
     ) {
       // Only warn for user-defined components, not internal ones like Suspense.
       return;

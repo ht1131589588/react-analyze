@@ -374,6 +374,45 @@ export function getInObject(object: Object, path: Array<string | number>): any {
   }, object);
 }
 
+export function deletePathInObject(
+  object: Object,
+  path: Array<string | number>,
+) {
+  const length = path.length;
+  const last = path[length - 1];
+  if (object != null) {
+    const parent = getInObject(object, path.slice(0, length - 1));
+    if (parent) {
+      if (Array.isArray(parent)) {
+        parent.splice(((last: any): number), 1);
+      } else {
+        delete parent[last];
+      }
+    }
+  }
+}
+
+export function renamePathInObject(
+  object: Object,
+  oldPath: Array<string | number>,
+  newPath: Array<string | number>,
+) {
+  const length = oldPath.length;
+  if (object != null) {
+    const parent = getInObject(object, oldPath.slice(0, length - 1));
+    if (parent) {
+      const lastOld = oldPath[length - 1];
+      const lastNew = newPath[length - 1];
+      parent[lastNew] = parent[lastOld];
+      if (Array.isArray(parent)) {
+        parent.splice(((lastOld: any): number), 1);
+      } else {
+        delete parent[lastOld];
+      }
+    }
+  }
+}
+
 export function setInObject(
   object: Object,
   path: Array<string | number>,
@@ -401,6 +440,7 @@ export type DataType =
   | 'html_element'
   | 'infinity'
   | 'iterator'
+  | 'opaque_iterator'
   | 'nan'
   | 'null'
   | 'number'
@@ -461,7 +501,9 @@ export function getDataType(data: Object): DataType {
         // but this seems kind of awkward and expensive.
         return 'array_buffer';
       } else if (typeof data[Symbol.iterator] === 'function') {
-        return 'iterator';
+        return data[Symbol.iterator]() === data
+          ? 'opaque_iterator'
+          : 'iterator';
       } else if (data.constructor && data.constructor.name === 'RegExp') {
         return 'regexp';
       } else {
@@ -640,6 +682,7 @@ export function formatDataForPreview(
       }
     case 'iterator':
       const name = data.constructor.name;
+
       if (showFormattedValue) {
         // TRICKY
         // Don't use [...spread] syntax for this purpose.
@@ -678,6 +721,9 @@ export function formatDataForPreview(
       } else {
         return `${name}(${data.size})`;
       }
+    case 'opaque_iterator': {
+      return data[Symbol.toStringTag];
+    }
     case 'date':
       return data.toString();
     case 'object':

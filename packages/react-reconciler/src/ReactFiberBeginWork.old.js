@@ -8,7 +8,6 @@
  */
 
 import type {ReactProviderType, ReactContext} from 'shared/ReactTypes';
-import type {BlockComponent} from 'react/src/ReactBlock';
 import type {LazyComponent as LazyComponentType} from 'react/src/ReactLazy';
 import type {Fiber} from './ReactInternalTypes';
 import type {FiberRoot} from './ReactInternalTypes';
@@ -49,7 +48,6 @@ import {
   IncompleteClassComponent,
   FundamentalComponent,
   ScopeComponent,
-  Block,
   OffscreenComponent,
   LegacyHiddenComponent,
 } from './ReactWorkTags';
@@ -76,7 +74,6 @@ import {
   enableFundamentalAPI,
   warnAboutDefaultPropsOnFunctionComponents,
   enableScopeAPI,
-  enableBlocksAPI,
 } from 'shared/ReactFeatureFlags';
 import invariant from 'shared/invariant';
 import shallowEqual from 'shared/shallowEqual';
@@ -109,6 +106,7 @@ import {
   SyncLane,
   OffscreenLane,
   DefaultHydrationLane,
+  SomeRetryLane,
   NoTimestamp,
   includesSomeLane,
   laneToLanes,
@@ -781,75 +779,6 @@ function updateFunctionComponent(
   return workInProgress.child;
 }
 
-function updateBlock<Props, Data>(
-  current: Fiber | null,
-  workInProgress: Fiber,
-  block: BlockComponent<Props, Data>,
-  nextProps: any,
-  renderLanes: Lanes,
-) {
-  // TODO: current can be non-null here even if the component
-  // hasn't yet mounted. This happens after the first render suspends.
-  // We'll need to figure out if this is fine or can cause issues.
-
-  const render = block._render;
-  const data = block._data;
-
-  // The rest is a fork of updateFunctionComponent
-  let nextChildren;
-  prepareToReadContext(workInProgress, renderLanes);
-  if (__DEV__) {
-    ReactCurrentOwner.current = workInProgress;
-    setIsRendering(true);
-    nextChildren = renderWithHooks(
-      current,
-      workInProgress,
-      render,
-      nextProps,
-      data,
-      renderLanes,
-    );
-    if (
-      debugRenderPhaseSideEffectsForStrictMode &&
-      workInProgress.mode & StrictMode
-    ) {
-      disableLogs();
-      try {
-        nextChildren = renderWithHooks(
-          current,
-          workInProgress,
-          render,
-          nextProps,
-          data,
-          renderLanes,
-        );
-      } finally {
-        reenableLogs();
-      }
-    }
-    setIsRendering(false);
-  } else {
-    nextChildren = renderWithHooks(
-      current,
-      workInProgress,
-      render,
-      nextProps,
-      data,
-      renderLanes,
-    );
-  }
-
-  if (current !== null && !didReceiveUpdate) {
-    bailoutHooks(current, workInProgress, renderLanes);
-    return bailoutOnAlreadyFinishedWork(current, workInProgress, renderLanes);
-  }
-
-  // React DevTools reads this flag.
-  workInProgress.flags |= PerformedWork;
-  reconcileChildren(current, workInProgress, nextChildren, renderLanes);
-  return workInProgress.child;
-}
-
 function updateClassComponent(
   current: Fiber | null,
   workInProgress: Fiber,
@@ -1263,20 +1192,6 @@ function mountLazyComponent(
       );
       return child;
     }
-    case Block: {
-      if (enableBlocksAPI) {
-        // TODO: Resolve for Hot Reloading.
-        child = updateBlock(
-          null,
-          workInProgress,
-          Component,
-          props,
-          renderLanes,
-        );
-        return child;
-      }
-      break;
-    }
   }
   let hint = '';
   if (__DEV__) {
@@ -1657,6 +1572,7 @@ function updateSuspenseOffscreenState(
   };
 }
 
+// TODO: Probably should inline this back
 function shouldRemainOnFallback(
   suspenseContext: SuspenseContext,
   current: null | Fiber,
@@ -1789,9 +1705,9 @@ function updateSuspenseComponent(current, workInProgress, renderLanes) {
       }
     }
 
+    const nextPrimaryChildren = nextProps.children;
+    const nextFallbackChildren = nextProps.fallback;
     if (showFallback) {
-      const nextPrimaryChildren = nextProps.children;
-      const nextFallbackChildren = nextProps.fallback;
       const fallbackFragment = mountSuspenseFallbackChildren(
         workInProgress,
         nextPrimaryChildren,
@@ -1804,8 +1720,36 @@ function updateSuspenseComponent(current, workInProgress, renderLanes) {
       );
       workInProgress.memoizedState = SUSPENDED_MARKER;
       return fallbackFragment;
+    } else if (typeof nextProps.unstable_expectedLoadTime === 'number') {
+      // This is a CPU-bound tree. Skip this tree and show a placeholder to
+      // unblock the surrounding content. Then immediately retry after the
+      // initial commit.
+      const fallbackFragment = mountSuspenseFallbackChildren(
+        workInProgress,
+        nextPrimaryChildren,
+        nextFallbackChildren,
+        renderLanes,
+      );
+      const primaryChildFragment: Fiber = (workInProgress.child: any);
+      primaryChildFragment.memoizedState = mountSuspenseOffscreenState(
+        renderLanes,
+      );
+      workInProgress.memoizedState = SUSPENDED_MARKER;
+
+      // Since nothing actually suspended, there will nothing to ping this to
+      // get it started back up to attempt the next item. While in terms of
+      // priority this work has the same priority as this current render, it's
+      // not part of the same transition once the transition has committed. If
+      // it's sync, we still want to yield so that it can be painted.
+      // Conceptually, this is really the same as pinging. We can use any
+      // RetryLane even if it's the one currently rendering since we're leaving
+      // it behind on this node.
+      workInProgress.lanes = SomeRetryLane;
+      if (enableSchedulerTracing) {
+        markSpawnedWork(SomeRetryLane);
+      }
+      return fallbackFragment;
     } else {
-      const nextPrimaryChildren = nextProps.children;
       return mountSuspensePrimaryChildren(
         workInProgress,
         nextPrimaryChildren,
@@ -3437,14 +3381,6 @@ function beginWork(
     case ScopeComponent: {
       if (enableScopeAPI) {
         return updateScopeComponent(current, workInProgress, renderLanes);
-      }
-      break;
-    }
-    case Block: {
-      if (enableBlocksAPI) {
-        const block = workInProgress.type;
-        const props = workInProgress.pendingProps;
-        return updateBlock(current, workInProgress, block, props, renderLanes);
       }
       break;
     }

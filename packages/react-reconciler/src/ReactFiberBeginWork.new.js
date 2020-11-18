@@ -8,7 +8,6 @@
  */
 
 import type {ReactProviderType, ReactContext} from 'shared/ReactTypes';
-import type {BlockComponent} from 'react/src/ReactBlock';
 import type {LazyComponent as LazyComponentType} from 'react/src/ReactLazy';
 import type {Fiber} from './ReactInternalTypes';
 import type {FiberRoot} from './ReactInternalTypes';
@@ -49,7 +48,6 @@ import {
   IncompleteClassComponent,
   FundamentalComponent,
   ScopeComponent,
-  Block,
   OffscreenComponent,
   LegacyHiddenComponent,
 } from './ReactWorkTags';
@@ -64,7 +62,6 @@ import {
   Ref,
   Deletion,
   ForceUpdateForLegacySuspense,
-  StaticMask,
 } from './ReactFiberFlags';
 import ReactSharedInternals from 'shared/ReactSharedInternals';
 import {
@@ -77,7 +74,6 @@ import {
   enableFundamentalAPI,
   warnAboutDefaultPropsOnFunctionComponents,
   enableScopeAPI,
-  enableBlocksAPI,
 } from 'shared/ReactFeatureFlags';
 import invariant from 'shared/invariant';
 import shallowEqual from 'shared/shallowEqual';
@@ -110,6 +106,7 @@ import {
   SyncLane,
   OffscreenLane,
   DefaultHydrationLane,
+  SomeRetryLane,
   NoTimestamp,
   includesSomeLane,
   laneToLanes,
@@ -782,75 +779,6 @@ function updateFunctionComponent(
   return workInProgress.child;
 }
 
-function updateBlock<Props, Data>(
-  current: Fiber | null,
-  workInProgress: Fiber,
-  block: BlockComponent<Props, Data>,
-  nextProps: any,
-  renderLanes: Lanes,
-) {
-  // TODO: current can be non-null here even if the component
-  // hasn't yet mounted. This happens after the first render suspends.
-  // We'll need to figure out if this is fine or can cause issues.
-
-  const render = block._render;
-  const data = block._data;
-
-  // The rest is a fork of updateFunctionComponent
-  let nextChildren;
-  prepareToReadContext(workInProgress, renderLanes);
-  if (__DEV__) {
-    ReactCurrentOwner.current = workInProgress;
-    setIsRendering(true);
-    nextChildren = renderWithHooks(
-      current,
-      workInProgress,
-      render,
-      nextProps,
-      data,
-      renderLanes,
-    );
-    if (
-      debugRenderPhaseSideEffectsForStrictMode &&
-      workInProgress.mode & StrictMode
-    ) {
-      disableLogs();
-      try {
-        nextChildren = renderWithHooks(
-          current,
-          workInProgress,
-          render,
-          nextProps,
-          data,
-          renderLanes,
-        );
-      } finally {
-        reenableLogs();
-      }
-    }
-    setIsRendering(false);
-  } else {
-    nextChildren = renderWithHooks(
-      current,
-      workInProgress,
-      render,
-      nextProps,
-      data,
-      renderLanes,
-    );
-  }
-
-  if (current !== null && !didReceiveUpdate) {
-    bailoutHooks(current, workInProgress, renderLanes);
-    return bailoutOnAlreadyFinishedWork(current, workInProgress, renderLanes);
-  }
-
-  // React DevTools reads this flag.
-  workInProgress.flags |= PerformedWork;
-  reconcileChildren(current, workInProgress, nextChildren, renderLanes);
-  return workInProgress.child;
-}
-
 function updateClassComponent(
   current: Fiber | null,
   workInProgress: Fiber,
@@ -1264,20 +1192,6 @@ function mountLazyComponent(
       );
       return child;
     }
-    case Block: {
-      if (enableBlocksAPI) {
-        // TODO: Resolve for Hot Reloading.
-        child = updateBlock(
-          null,
-          workInProgress,
-          Component,
-          props,
-          renderLanes,
-        );
-        return child;
-      }
-      break;
-    }
   }
   let hint = '';
   if (__DEV__) {
@@ -1658,6 +1572,7 @@ function updateSuspenseOffscreenState(
   };
 }
 
+// TODO: Probably should inline this back
 function shouldRemainOnFallback(
   suspenseContext: SuspenseContext,
   current: null | Fiber,
@@ -1790,9 +1705,9 @@ function updateSuspenseComponent(current, workInProgress, renderLanes) {
       }
     }
 
+    const nextPrimaryChildren = nextProps.children;
+    const nextFallbackChildren = nextProps.fallback;
     if (showFallback) {
-      const nextPrimaryChildren = nextProps.children;
-      const nextFallbackChildren = nextProps.fallback;
       const fallbackFragment = mountSuspenseFallbackChildren(
         workInProgress,
         nextPrimaryChildren,
@@ -1805,8 +1720,36 @@ function updateSuspenseComponent(current, workInProgress, renderLanes) {
       );
       workInProgress.memoizedState = SUSPENDED_MARKER;
       return fallbackFragment;
+    } else if (typeof nextProps.unstable_expectedLoadTime === 'number') {
+      // This is a CPU-bound tree. Skip this tree and show a placeholder to
+      // unblock the surrounding content. Then immediately retry after the
+      // initial commit.
+      const fallbackFragment = mountSuspenseFallbackChildren(
+        workInProgress,
+        nextPrimaryChildren,
+        nextFallbackChildren,
+        renderLanes,
+      );
+      const primaryChildFragment: Fiber = (workInProgress.child: any);
+      primaryChildFragment.memoizedState = mountSuspenseOffscreenState(
+        renderLanes,
+      );
+      workInProgress.memoizedState = SUSPENDED_MARKER;
+
+      // Since nothing actually suspended, there will nothing to ping this to
+      // get it started back up to attempt the next item. While in terms of
+      // priority this work has the same priority as this current render, it's
+      // not part of the same transition once the transition has committed. If
+      // it's sync, we still want to yield so that it can be painted.
+      // Conceptually, this is really the same as pinging. We can use any
+      // RetryLane even if it's the one currently rendering since we're leaving
+      // it behind on this node.
+      workInProgress.lanes = SomeRetryLane;
+      if (enableSchedulerTracing) {
+        markSpawnedWork(SomeRetryLane);
+      }
+      return fallbackFragment;
     } else {
-      const nextPrimaryChildren = nextProps.children;
       return mountSuspensePrimaryChildren(
         workInProgress,
         nextPrimaryChildren,
@@ -2061,14 +2004,9 @@ function updateSuspensePrimaryChildren(
   primaryChildFragment.sibling = null;
   if (currentFallbackChildFragment !== null) {
     // Delete the fallback child fragment
-    const deletions = workInProgress.deletions;
-    if (deletions === null) {
-      workInProgress.deletions = [currentFallbackChildFragment];
-      // TODO (effects) Rename this to better reflect its new usage (e.g. ChildDeletions)
-      workInProgress.flags |= Deletion;
-    } else {
-      deletions.push(currentFallbackChildFragment);
-    }
+    currentFallbackChildFragment.nextEffect = null;
+    currentFallbackChildFragment.flags = Deletion;
+    workInProgress.firstEffect = workInProgress.lastEffect = currentFallbackChildFragment;
   }
 
   workInProgress.child = primaryChildFragment;
@@ -2125,19 +2063,24 @@ function updateSuspenseFallbackChildren(
 
     // The fallback fiber was added as a deletion effect during the first pass.
     // However, since we're going to remain on the fallback, we no longer want
-    // to delete it.
-    workInProgress.deletions = null;
+    // to delete it. So we need to remove it from the list. Deletions are stored
+    // on the same list as effects. We want to keep the effects from the primary
+    // tree. So we copy the primary child fragment's effect list, which does not
+    // include the fallback deletion effect.
+    const progressedLastEffect = primaryChildFragment.lastEffect;
+    if (progressedLastEffect !== null) {
+      workInProgress.firstEffect = primaryChildFragment.firstEffect;
+      workInProgress.lastEffect = progressedLastEffect;
+      progressedLastEffect.nextEffect = null;
+    } else {
+      // TODO: Reset this somewhere else? Lol legacy mode is so weird.
+      workInProgress.firstEffect = workInProgress.lastEffect = null;
+    }
   } else {
     primaryChildFragment = createWorkInProgressOffscreenFiber(
       currentPrimaryChildFragment,
       primaryChildProps,
     );
-
-    // Since we're reusing a current tree, we need to reuse the flags, too.
-    // (We don't do this in legacy mode, because in legacy mode we don't re-use
-    // the current tree; see previous branch.)
-    primaryChildFragment.subtreeFlags =
-      currentPrimaryChildFragment.subtreeFlags & StaticMask;
   }
   let fallbackChildFragment;
   if (currentFallbackChildFragment !== null) {
@@ -2622,6 +2565,7 @@ function initSuspenseListRenderState(
   tail: null | Fiber,
   lastContentRow: null | Fiber,
   tailMode: SuspenseListTailMode,
+  lastEffectBeforeRendering: null | Fiber,
 ): void {
   const renderState: null | SuspenseListRenderState =
     workInProgress.memoizedState;
@@ -2633,6 +2577,7 @@ function initSuspenseListRenderState(
       last: lastContentRow,
       tail: tail,
       tailMode: tailMode,
+      lastEffect: lastEffectBeforeRendering,
     }: SuspenseListRenderState);
   } else {
     // We can reuse the existing object from previous renders.
@@ -2642,6 +2587,7 @@ function initSuspenseListRenderState(
     renderState.last = lastContentRow;
     renderState.tail = tail;
     renderState.tailMode = tailMode;
+    renderState.lastEffect = lastEffectBeforeRendering;
   }
 }
 
@@ -2723,6 +2669,7 @@ function updateSuspenseListComponent(
           tail,
           lastContentRow,
           tailMode,
+          workInProgress.lastEffect,
         );
         break;
       }
@@ -2754,6 +2701,7 @@ function updateSuspenseListComponent(
           tail,
           null, // last
           tailMode,
+          workInProgress.lastEffect,
         );
         break;
       }
@@ -2764,6 +2712,7 @@ function updateSuspenseListComponent(
           null, // tail
           null, // last
           undefined,
+          workInProgress.lastEffect,
         );
         break;
       }
@@ -3023,14 +2972,15 @@ function remountFiber(
 
     // Delete the old fiber and place the new one.
     // Since the old fiber is disconnected, we have to schedule it manually.
-    const deletions = returnFiber.deletions;
-    if (deletions === null) {
-      returnFiber.deletions = [current];
-      // TODO (effects) Rename this to better reflect its new usage (e.g. ChildDeletions)
-      returnFiber.flags |= Deletion;
+    const last = returnFiber.lastEffect;
+    if (last !== null) {
+      last.nextEffect = current;
+      returnFiber.lastEffect = current;
     } else {
-      deletions.push(current);
+      returnFiber.firstEffect = returnFiber.lastEffect = current;
     }
+    current.nextEffect = null;
+    current.flags = Deletion;
 
     newWorkInProgress.flags |= Placement;
 
@@ -3230,6 +3180,7 @@ function beginWork(
             // update in the past but didn't complete it.
             renderState.rendering = null;
             renderState.tail = null;
+            renderState.lastEffect = null;
           }
           pushSuspenseContext(workInProgress, suspenseStackCursor.current);
 
@@ -3430,14 +3381,6 @@ function beginWork(
     case ScopeComponent: {
       if (enableScopeAPI) {
         return updateScopeComponent(current, workInProgress, renderLanes);
-      }
-      break;
-    }
-    case Block: {
-      if (enableBlocksAPI) {
-        const block = workInProgress.type;
-        const props = workInProgress.pendingProps;
-        return updateBlock(current, workInProgress, block, props, renderLanes);
       }
       break;
     }
