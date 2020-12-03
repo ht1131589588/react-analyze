@@ -21,6 +21,7 @@ export const enableSchedulerTracing = __PROFILE__;
 export const enableSuspenseServerRenderer = false;
 export const enableSelectiveHydration = false;
 export const enableLazyElements = false;
+export const enableCache = false;
 export const enableSchedulerDebugging = false;
 export const debugRenderPhaseSideEffectsForStrictMode = true;
 export const disableJavaScriptURLs = false;
@@ -44,6 +45,7 @@ export const warnAboutSpreadingKeyToJSX = false;
 export const enableComponentStackLocations = false;
 export const enableLegacyFBSupport = false;
 export const enableFilterEmptyStringAttributesDOM = false;
+export const disableNativeComponentFrames = false;
 
 export const enableNewReconciler = false;
 export const deferRenderPhaseUpdateToNextBatch = true;

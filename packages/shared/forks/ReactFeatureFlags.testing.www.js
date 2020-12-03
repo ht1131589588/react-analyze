@@ -23,6 +23,7 @@ export const enableSchedulerTracing = false;
 export const enableSuspenseServerRenderer = true;
 export const enableSelectiveHydration = true;
 export const enableLazyElements = false;
+export const enableCache = false;
 export const disableJavaScriptURLs = true;
 export const disableInputAttributeSyncing = false;
 export const enableSchedulerDebugging = false;
@@ -43,6 +44,7 @@ export const warnAboutSpreadingKeyToJSX = false;
 export const enableComponentStackLocations = true;
 export const enableLegacyFBSupport = !__EXPERIMENTAL__;
 export const enableFilterEmptyStringAttributesDOM = false;
+export const disableNativeComponentFrames = false;
 
 export const enableNewReconciler = false;
 export const deferRenderPhaseUpdateToNextBatch = true;

@@ -542,19 +542,19 @@ export function scheduleUpdateOnFiber(
 
   if (enableProfilerTimer && enableProfilerNestedUpdateScheduledHook) {
     if (
-      executionContext === CommitContext &&
+      (executionContext & CommitContext) !== NoContext &&
       root === rootCommittingMutationOrLayoutEffects
     ) {
       if (fiber.mode & ProfileMode) {
         let current = fiber;
         while (current !== null) {
           if (current.tag === Profiler) {
-            const {onNestedUpdateScheduled} = current.memoizedProps;
+            const {id, onNestedUpdateScheduled} = current.memoizedProps;
             if (typeof onNestedUpdateScheduled === 'function') {
               if (enableSchedulerTracing) {
-                onNestedUpdateScheduled(root.memoizedInteractions);
+                onNestedUpdateScheduled(id, root.memoizedInteractions);
               } else {
-                onNestedUpdateScheduled();
+                onNestedUpdateScheduled(id);
               }
             }
           }
@@ -2240,7 +2240,7 @@ function commitRootImpl(root, renderPriorityLevel) {
     }
   }
 
-  if (remainingLanes === SyncLane) {
+  if (includesSomeLane(remainingLanes, (SyncLane: Lane))) {
     if (enableProfilerTimer && enableProfilerNestedUpdatePhase) {
       markNestedUpdateScheduled();
     }
@@ -2843,6 +2843,22 @@ export function captureCommitPhaseError(sourceFiber: Fiber, error: mixed) {
       }
     }
     fiber = fiber.return;
+  }
+
+  if (__DEV__) {
+    // TODO: Until we re-land skipUnmountedBoundaries (see #20147), this warning
+    // will fire for errors that are thrown by destroy functions inside deleted
+    // trees. What it should instead do is propagate the error to the parent of
+    // the deleted tree. In the meantime, do not add this warning to the
+    // allowlist; this is only for our internal use.
+    console.error(
+      'Internal React error: Attempted to capture a commit phase error ' +
+        'inside a detached tree. This indicates a bug in React. Likely ' +
+        'causes include deleting the same fiber more than once, committing an ' +
+        'already-finished tree, or an inconsistent return pointer.\n\n' +
+        'Error message:\n\n%s',
+      error,
+    );
   }
 }
 

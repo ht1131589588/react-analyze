@@ -90,6 +90,15 @@ const bundles = [
     externals: [],
   },
 
+  /******* Isomorphic Server Only *******/
+  {
+    bundleTypes: [NODE_DEV, NODE_PROD],
+    moduleType: ISOMORPHIC,
+    entry: 'react/unstable-index.server',
+    global: 'React',
+    externals: [],
+  },
+
   /******* React JSX Runtime *******/
   {
     bundleTypes: [
@@ -123,15 +132,6 @@ const bundles = [
     moduleType: ISOMORPHIC,
     entry: 'react/jsx-dev-runtime',
     global: 'JSXDEVRuntime',
-    externals: ['react'],
-  },
-
-  /******* React Cache (experimental, new) *******/
-  {
-    bundleTypes: __EXPERIMENTAL__ ? [NODE_DEV, NODE_PROD, NODE_PROFILING] : [],
-    moduleType: ISOMORPHIC,
-    entry: 'react/unstable-cache',
-    global: 'ReactCache',
     externals: ['react'],
   },
 
@@ -292,7 +292,7 @@ const bundles = [
     moduleType: RENDERER_UTILS,
     entry: 'react-transport-dom-webpack/node-loader',
     global: 'ReactFlightWebpackNodeLoader',
-    externals: [],
+    externals: ['acorn'],
   },
 
   /******* React Transport DOM Webpack Node.js CommonJS Loader *******/
@@ -301,7 +301,7 @@ const bundles = [
     moduleType: RENDERER_UTILS,
     entry: 'react-transport-dom-webpack/node-register',
     global: 'ReactFlightWebpackNodeRegister',
-    externals: ['url'],
+    externals: ['url', 'module'],
   },
 
   /******* React Transport DOM Server Relay *******/
@@ -355,6 +355,15 @@ const bundles = [
       'ReactFlightNativeRelayClientIntegration',
       'JSResourceReferenceImpl',
     ],
+  },
+
+  /******* React Suspense Test Utils *******/
+  {
+    bundleTypes: [NODE_ES2015],
+    moduleType: RENDERER_UTILS,
+    entry: 'react-suspense-test-utils',
+    global: 'ReactSuspenseTestUtils',
+    externals: ['react'],
   },
 
   /******* React ART *******/
